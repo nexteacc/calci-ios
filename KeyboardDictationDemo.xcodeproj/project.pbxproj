@@ -1,0 +1,220 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+FFFFFFFFFFFFFFFFFFFFFF01 = { isa = PBXFileReference; path = "Sources/CalciCredentials/APIKeyStore.swift"; sourceTree = SOURCE_ROOT; lastKnownFileType = sourcecode.swift; };
+FFFFFFFFFFFFFFFFFFFFFF02 = { isa = PBXBuildFile; fileRef = FFFFFFFFFFFFFFFFFFFFFF01; };
+FFFFFFFFFFFFFFFFFFFFFF03 = { isa = PBXBuildFile; fileRef = FFFFFFFFFFFFFFFFFFFFFF01; };
+		000000000000000000000001 = {
+			isa = "PBXProject";
+			buildConfigurationList = "00000000000000000000001D";
+			mainGroup = "00000000000000000000001B";
+			productRefGroup = "00000000000000000000001A";
+			projectDirPath = "";
+			projectRoot = "";
+			targets = ("000000000000000000000015", "00000000000000000000000B");
+			compatibilityVersion = "Xcode 15.0";
+			attributes = {
+				BuildIndependentTargetsInParallel = "YES";
+			};
+		};
+		000000000000000000000002 = {
+			isa = "PBXFileReference";
+			path = "Sources/KeyboardDictationDemoKeyboard/DemoKeyboardViewController.swift";
+			lastKnownFileType = "sourcecode.swift";
+			sourceTree = "<group>";
+		};
+		000000000000000000000003 = {
+			isa = "PBXFileReference";
+			path = "Sources/KeyboardDictationDemoKeyboard/WebAudioCapture.swift";
+			lastKnownFileType = "sourcecode.swift";
+			sourceTree = "<group>";
+		};
+		000000000000000000000004 = {
+			isa = "PBXFileReference";
+			path = "KeyboardInfo.plist";
+			lastKnownFileType = "text.plist.xml";
+			sourceTree = "<group>";
+		};
+		000000000000000000000005 = {
+			isa = "PBXFileReference";
+			path = "KeyboardDictationDemoKeyboard.appex";
+			explicitFileType = "wrapper.appex";
+			sourceTree = "BUILT_PRODUCTS_DIR";
+		};
+		000000000000000000000006 = {
+			isa = "XCBuildConfiguration";
+			name = "Debug";
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.sheng.dictationdemo.keyboard";
+				INFOPLIST_FILE = "KeyboardInfo.plist";
+				CODE_SIGN_ENTITLEMENTS = App.entitlements;
+				CODE_SIGN_STYLE = "Automatic";
+				SKIP_INSTALL = "YES";
+				APPLICATION_EXTENSION_API_ONLY = "YES";
+				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks");
+			};
+		};
+		000000000000000000000007 = {
+			isa = "XCConfigurationList";
+			buildConfigurations = ("000000000000000000000006");
+			defaultConfigurationName = "Debug";
+			defaultConfigurationIsVisible = 0;
+		};
+		000000000000000000000008 = {
+			isa = "PBXBuildFile";
+			fileRef = "000000000000000000000002";
+		};
+		000000000000000000000009 = {
+			isa = "PBXBuildFile";
+			fileRef = "000000000000000000000003";
+		};
+		00000000000000000000000A = {
+			isa = "PBXSourcesBuildPhase";
+			buildActionMask = 2147483647;
+			files = ("FFFFFFFFFFFFFFFFFFFFFF02", "000000000000000000000008", "000000000000000000000009");
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		00000000000000000000000B = {
+			isa = "PBXNativeTarget";
+			name = "KeyboardDictationDemoKeyboard";
+			productName = "KeyboardDictationDemoKeyboard";
+			productReference = "000000000000000000000005";
+			productType = "com.apple.product-type.app-extension";
+			buildConfigurationList = "000000000000000000000007";
+			buildPhases = ("00000000000000000000000A");
+			buildRules = ();
+			dependencies = ();
+		};
+		00000000000000000000000C = {
+			isa = "PBXFileReference";
+			path = "Sources/KeyboardDictationDemo/ContentView.swift";
+			lastKnownFileType = "sourcecode.swift";
+			sourceTree = "<group>";
+		};
+		00000000000000000000000D = {
+			isa = "PBXFileReference";
+			path = "Sources/KeyboardDictationDemo/KeyboardDictationDemo.swift";
+			lastKnownFileType = "sourcecode.swift";
+			sourceTree = "<group>";
+		};
+		00000000000000000000000E = {
+			isa = "PBXFileReference";
+			path = "Info.plist";
+			lastKnownFileType = "text.plist.xml";
+			sourceTree = "<group>";
+		};
+		00000000000000000000000F = {
+			isa = "PBXFileReference";
+			path = "KeyboardDictationDemo.app";
+			explicitFileType = "wrapper.app";
+			sourceTree = "BUILT_PRODUCTS_DIR";
+		};
+		000000000000000000000010 = {
+			isa = "XCBuildConfiguration";
+			name = "Debug";
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.sheng.dictationdemo";
+				INFOPLIST_FILE = "Info.plist";
+				CODE_SIGN_ENTITLEMENTS = App.entitlements;
+				CODE_SIGN_STYLE = "Automatic";
+				SKIP_INSTALL = "NO";
+			};
+		};
+		000000000000000000000011 = {
+			isa = "XCConfigurationList";
+			buildConfigurations = ("000000000000000000000010");
+			defaultConfigurationName = "Debug";
+			defaultConfigurationIsVisible = 0;
+		};
+		000000000000000000000012 = {
+			isa = "PBXBuildFile";
+			fileRef = "00000000000000000000000C";
+		};
+		000000000000000000000013 = {
+			isa = "PBXBuildFile";
+			fileRef = "00000000000000000000000D";
+		};
+		000000000000000000000014 = {
+			isa = "PBXSourcesBuildPhase";
+			buildActionMask = 2147483647;
+			files = ("FFFFFFFFFFFFFFFFFFFFFF03", "000000000000000000000012", "000000000000000000000013");
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000015 = {
+			isa = "PBXNativeTarget";
+			name = "KeyboardDictationDemo";
+			productName = "KeyboardDictationDemo";
+			productReference = "00000000000000000000000F";
+			productType = "com.apple.product-type.application";
+			buildConfigurationList = "000000000000000000000011";
+			buildPhases = ("000000000000000000000014", "000000000000000000000019");
+			buildRules = ();
+			dependencies = ("000000000000000000000017");
+		};
+		000000000000000000000016 = {
+			isa = "PBXContainerItemProxy";
+			containerPortal = "000000000000000000000001";
+			proxyType = 1;
+			remoteGlobalIDString = "00000000000000000000000B";
+			remoteInfo = "KeyboardDictationDemoKeyboard";
+		};
+		000000000000000000000017 = {
+			isa = "PBXTargetDependency";
+			target = "00000000000000000000000B";
+			targetProxy = "000000000000000000000016";
+		};
+		000000000000000000000018 = {
+			isa = "PBXBuildFile";
+			fileRef = "000000000000000000000005";
+			settings = {
+				ATTRIBUTES = ("RemoveHeadersOnCopy");
+			};
+		};
+		000000000000000000000019 = {
+			isa = "PBXCopyFilesBuildPhase";
+			buildActionMask = 2147483647;
+			files = ("000000000000000000000018");
+			runOnlyForDeploymentPostprocessing = 0;
+			name = "Embed App Extensions";
+			dstPath = "";
+			dstSubfolderSpec = 13;
+		};
+		00000000000000000000001A = {
+			isa = "PBXGroup";
+			name = "Products";
+			children = ("000000000000000000000005", "00000000000000000000000F");
+			sourceTree = "<group>";
+		};
+		00000000000000000000001B = {
+			isa = "PBXGroup";
+			children = ("000000000000000000000002", "000000000000000000000003", "000000000000000000000004", "00000000000000000000000C", "00000000000000000000000D", "00000000000000000000000E", "00000000000000000000001A");
+			sourceTree = "<group>";
+		};
+		00000000000000000000001C = {
+			isa = "XCBuildConfiguration";
+			name = "Debug";
+			buildSettings = {
+				SDKROOT = "iphoneos";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				IPHONEOS_DEPLOYMENT_TARGET = "17.0";
+				SWIFT_VERSION = "5.0";
+				TARGETED_DEVICE_FAMILY = "1";
+				ENABLE_DEBUG_DYLIB = "NO";
+				DEVELOPMENT_TEAM = "4DSW97WVUS";
+			};
+		};
+		00000000000000000000001D = {
+			isa = "XCConfigurationList";
+			buildConfigurations = ("00000000000000000000001C");
+			defaultConfigurationName = "Debug";
+			defaultConfigurationIsVisible = 0;
+		};
+	};
+	rootObject = "000000000000000000000001";
+}

@@ -4,3 +4,42 @@
 .release/
 *.ipa
 .env.local
+
+xcuserdata/
+.calci-local/
+__pycache__/
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile
+*.p8
+.netrc
+.venv/
+
+# Generated Xcode output
+DerivedData/
+build/
+*.xcarchive
+*.xcresult
+*.xcuserstate
+*.dSYM
+*.dSYM.zip
+
+# Device diagnostics, recordings and transcription exports
+*.log
+*.ips
+*.crash
+*.wav
+*.m4a
+*.pcm
+*.caf
+recordings/
+diagnostics/
+transcripts/

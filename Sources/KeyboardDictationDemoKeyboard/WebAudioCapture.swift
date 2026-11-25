@@ -8,11 +8,11 @@ import WebKit
 /// Emits 16 kHz mono Int16 PCM chunks through `onAudio`.
 @MainActor
 final class WebAudioCapture: NSObject {
-    static let sampleRate: Double = 16_000
+    static let sampleRate: Double = 24_000
 
     var onReady: (() -> Void)?
     var onStarted: (() -> Void)?
-    var onAudio: ((Data, Float) -> Void)?
+    var onAudio: ((Data, [UInt8]) -> Void)?
     var onEnded: ((String) -> Void)?
 
     private(set) var isReady = false
@@ -85,7 +85,7 @@ final class WebAudioCapture: NSObject {
             onStarted?()
         case "audio":
             guard isCapturing, let base64 = message["data"] as? String, let data = Data(base64Encoded: base64) else { return }
-            onAudio?(data, (message["rms"] as? NSNumber)?.floatValue ?? 0)
+            onAudio?(data, message["bands"] as? [UInt8] ?? [])
         case "interrupted", "failed":
             finish(reason: "\(type): \(message["reason"] as? String ?? "unknown")")
         default:
@@ -141,7 +141,12 @@ final class WebAudioCapture: NSObject {
         processor.connect(sink);
         sink.connect(context.destination);
         source = context.createMediaStreamSource(stream);
-        source.connect(processor);
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.8;
+        const bins = new Uint8Array(analyser.frequencyBinCount);
+        source.connect(analyser);
+        analyser.connect(processor);
         context.onstatechange = () => { if (context.state !== 'running') interrupted('context-' + context.state); };
         if (audioSession) audioSession.onstatechange = () => { if (audioSession.state === 'interrupted') interrupted('audio-session-interrupted'); };
         lastHeartbeat = performance.now();
@@ -160,7 +165,8 @@ final class WebAudioCapture: NSObject {
               sum = 0; count = 0;
             }
           }
-          if (written > 0) post({ type: 'audio', data: encode(output.subarray(0, written)), rms: Math.sqrt(energy / input.length) });
+          analyser.getByteFrequencyData(bins);
+          if (written > 0) post({ type: 'audio', data: encode(output.subarray(0, written)), bands: Array.from({length: 12}, (_, i) => bins[6 + Math.floor(i * 45 / 12)]) });
         };
         post({ type: 'started', sampleRate: context.sampleRate });
       } catch (error) {

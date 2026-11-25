@@ -1,97 +1,101 @@
 import AVFoundation
-import Speech
+#if SWIFT_PACKAGE
+import CalciCredentials
+#endif
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var microphone = AVAudioApplication.shared.recordPermission
-    @State private var speech = SFSpeechRecognizer.authorizationStatus()
     @State private var text = ""
-    @State private var speechCheck = ""
-    @State private var speechTask: SFSpeechRecognitionTask?
+    @State private var key = ""
+    @State private var saved = APIKeyStore.read() != nil
+    @State private var keyError = false
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section("1. Permissions") {
-                    LabeledContent("Microphone", value: microphoneLabel)
-                    LabeledContent("Speech recognition", value: speechLabel)
-                    Button("Grant permissions", action: requestPermissions)
-                    Button("Check Apple Speech in this app", action: checkSpeech)
-                    if !speechCheck.isEmpty { Text(speechCheck).font(.footnote) }
+        Form {
+            Section {
+                LabeledContent("麦克风", value: microphoneStatus)
+                if microphone == .undetermined {
+                    Button("允许使用麦克风", action: requestMicrophone)
+                } else if microphone == .denied {
+                    Button("在设置中允许麦克风", action: openSettings)
                 }
+            } header: {
+                stepTitle("1. 权限")
+            }
 
-                Section("2. Enable the keyboard") {
-                    Text("Settings → General → Keyboard → Keyboards → Add New Keyboard → Dictation Demo, then turn on Allow Full Access.")
-                    Button("Open Settings") {
-                        if let url = URL(string: UIApplication.openSettingsURLString) {
-                            UIApplication.shared.open(url)
-                        }
+            Section {
+                Button("打开设置", action: openSettings)
+            } header: {
+                stepTitle("2. 添加键盘")
+            }
+
+            Section {
+                Picker("服务", selection: .constant("OpenAI")) {
+                    Text("OpenAI").tag("OpenAI")
+                }.pickerStyle(.menu)
+                SecureField(saved ? "输入新密钥" : "输入 API 密钥", text: $key)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                if !key.isEmpty {
+                    Button("保存密钥") {
+                        let value = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                        keyError = value.isEmpty || !APIKeyStore.save(value)
+                        if !keyError { saved = true; key = "" }
+                    }
+                } else if saved {
+                    Button("移除已保存的密钥", role: .destructive) {
+                        keyError = !APIKeyStore.remove()
+                        if !keyError { saved = false }
                     }
                 }
+                if keyError { Text("密钥未更新，请重试。") }
+            } header: { stepTitle("转写") }
 
-                Section("3. Try it") {
-                    TextField("Switch to the Dictation Demo keyboard here", text: $text, axis: .vertical)
-                        .lineLimit(3...8)
-                    Text("Tap Dictate on the keyboard, speak, then tap Stop. Audio is captured by a hidden WKWebView inside the keyboard, so you never leave this app.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+            Section {
+                TextField("听写结果会出现在这里", text: $text, axis: .vertical)
+                    .lineLimit(2...5)
+            } header: {
+                stepTitle("3. 试一句")
+            } footer: {
+                Text("切到 Calci，按住圆键说话，松手结束。")
             }
-            .navigationTitle("Keyboard Dictation")
+        }
+        .navigationTitle("Calci")
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: scenePhase, initial: true) {
+            guard scenePhase == .active else { return }
+            microphone = AVAudioApplication.shared.recordPermission
         }
     }
 
-    private var microphoneLabel: String {
+    private func stepTitle(_ title: String) -> some View {
+        Text(title)
+            .font(.headline)
+            .foregroundStyle(.primary)
+            .textCase(nil)
+    }
+
+    private var microphoneStatus: String {
         switch microphone {
-        case .granted: "Granted"
-        case .denied: "Denied"
-        default: "Not requested"
+        case .granted: "已允许"
+        case .denied: "未允许"
+        default: "未请求"
         }
     }
 
-    private var speechLabel: String {
-        switch speech {
-        case .authorized: "Granted"
-        case .denied: "Denied"
-        case .restricted: "Restricted"
-        default: "Not requested"
+    private func requestMicrophone() {
+        Task { @MainActor in
+            _ = await AVAudioApplication.requestRecordPermission()
+            microphone = AVAudioApplication.shared.recordPermission
         }
     }
 
-    /// Feeds a second of silence to the recognizer to tell a simulator-wide Speech failure
-    /// apart from one specific to the keyboard extension sandbox.
-    private func checkSpeech() {
-        speechCheck = "Checking…"
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) else {
-            speechCheck = "No recognizer for en-US"
-            return
+    private func openSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
         }
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
-        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16_000)!
-        buffer.frameLength = 16_000
-        memset(buffer.int16ChannelData![0], 0, 32_000)
-        speechTask = recognizer.recognitionTask(with: request) { result, error in
-            DispatchQueue.main.async {
-                if let error {
-                    speechCheck = "Speech error: \(error.localizedDescription)"
-                } else if result?.isFinal == true {
-                    speechCheck = "Speech works in the app."
-                }
-            }
-        }
-        request.append(buffer)
-        request.endAudio()
     }
 
-    private func requestPermissions() {
-        AVAudioApplication.requestRecordPermission { _ in
-            SFSpeechRecognizer.requestAuthorization { _ in
-                DispatchQueue.main.async {
-                    microphone = AVAudioApplication.shared.recordPermission
-                    speech = SFSpeechRecognizer.authorizationStatus()
-                }
-            }
-        }
-    }
 }
