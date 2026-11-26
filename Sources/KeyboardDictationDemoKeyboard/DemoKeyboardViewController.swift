@@ -24,17 +24,14 @@ private func trace(_ message: String) {
 final class DemoKeyboardViewController: UIInputViewController {
     // Dimensions of the compact panel, excluding the iOS strip below it.
     private enum Panel {
-        static let height: CGFloat = 144
+        static let height: CGFloat = 176
         static let sideInset: CGFloat = 12
         static let voiceDiameter: CGFloat = 82
         static let meterSize = CGSize(width: 76, height: 24)
         static let actionHeight: CGFloat = 44
-        static let actionWidth: CGFloat = 70
-        static let panelColor = UIColor { traits in
-            traits.userInterfaceStyle == .dark
-                ? UIColor(red: 0.16, green: 0.18, blue: 0.22, alpha: 1)
-                : UIColor(red: 0.84, green: 0.87, blue: 0.92, alpha: 1)
-        }
+        static let actionWidth: CGFloat = 96
+        static let deleteWidth: CGFloat = 48
+        static let keyCornerRadius: CGFloat = 8
         static let voiceColor = UIColor { traits in
             traits.userInterfaceStyle == .dark
                 ? UIColor(white: 0.25, alpha: 1)
@@ -45,10 +42,6 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     private let capture = WebAudioCapture()
     private let dictateButton = UIButton(type: .custom)
-    private let microphoneIcon = UIImageView(image: UIImage(
-        systemName: "mic.fill",
-        withConfiguration: UIImage.SymbolConfiguration(pointSize: 31, weight: .medium)
-    ))
     private let meter = UIView()
     private let gestureHint = UILabel()
     private var isDictationTouchDown = false
@@ -85,7 +78,22 @@ final class DemoKeyboardViewController: UIInputViewController {
     private var recording: Turn?
     /// Text currently inserted for the in-flight partial result, replaced as results refine.
     private var insertedPartial = ""
-    private var expectedContext: String?
+    private struct InputContext: Equatable {
+        let document: UUID
+        let before: String?
+        let after: String?
+        let selection: String?
+    }
+
+    private var currentContext: InputContext {
+        let proxy = textDocumentProxy
+        return InputContext(document: proxy.documentIdentifier,
+                            before: proxy.documentContextBeforeInput,
+                            after: proxy.documentContextAfterInput,
+                            selection: proxy.selectedText)
+    }
+
+    private var expectedContext: InputContext?
     private var capturedBytes = 0
 
     override func viewDidLoad() {
@@ -210,7 +218,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         // text after the user moved the cursor or switched to another document.
         if turns.first === turn {
             guard recordingDocument == textDocumentProxy.documentIdentifier,
-                  textDocumentProxy.documentContextBeforeInput == expectedContext else {
+                  currentContext == expectedContext else {
                 finishRecognition()
                 return
             }
@@ -285,7 +293,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         idleTimeout?.cancel()
         let (frames, continuation) = AsyncStream<Data>.makeStream()
         let turn = Turn(continuation)
-        if turns.isEmpty { expectedContext = textDocumentProxy.documentContextBeforeInput }
+        if turns.isEmpty { expectedContext = currentContext }
         turn.connection = connection
         trace("turn=\(turn.id) connection=\(connection.id) hold accepted provider=\(provider) standby=\(preflight) msSinceStandbyStart=\(age)")
         recordingDocument = textDocumentProxy.documentIdentifier
@@ -329,7 +337,7 @@ final class DemoKeyboardViewController: UIInputViewController {
                         }
                         guard let self, !Task.isCancelled, !turn.done else { break }
                         guard self.textDocumentProxy.documentIdentifier == document else { self.finishRecognition(); break }
-                        guard self.textDocumentProxy.documentContextBeforeInput == self.expectedContext else {
+                        guard self.currentContext == self.expectedContext else {
                             trace("input position changed")
                             self.finishRecognition()
                             break
@@ -428,9 +436,10 @@ final class DemoKeyboardViewController: UIInputViewController {
         // Only rewrite the suffix that changed to minimise flicker in the host field.
         let common = zip(insertedPartial, text).prefix { $0 == $1 }.count
         for _ in 0..<(insertedPartial.count - common) { textDocumentProxy.deleteBackward() }
-        textDocumentProxy.insertText(String(text.dropFirst(common)))
+        let suffix = String(text.dropFirst(common))
+        if !suffix.isEmpty { textDocumentProxy.insertText(suffix) }
         trace("inserted transcript characters=\(text.count)")
-        expectedContext = textDocumentProxy.documentContextBeforeInput
+        expectedContext = currentContext
         insertedPartial = text
     }
 
@@ -461,7 +470,7 @@ final class DemoKeyboardViewController: UIInputViewController {
     }
 
     private func flushTurns() {
-        guard textDocumentProxy.documentContextBeforeInput == expectedContext else {
+        guard currentContext == expectedContext else {
             finishRecognition()
             return
         }
@@ -519,7 +528,7 @@ final class DemoKeyboardViewController: UIInputViewController {
                           self.textDocumentProxy.documentIdentifier == document,
                           !self.capture.isCapturing, self.turns.isEmpty else { return }
                     let proxy = self.textDocumentProxy
-                    if !clearing && ProcessInfo.processInfo.systemUptime - started >= 1.2 {
+                    if !clearing && ProcessInfo.processInfo.systemUptime - started >= 1.0 {
                         clearing = true
                         self.gestureHint.text = "正在清空"
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -613,7 +622,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         waveFade.endPoint = CGPoint(x: 1, y: 0.5)
         meter.layer.mask = waveFade
         refreshTheme()
-        let indicators: [UIView] = [microphoneIcon, spinner, failureIcon]
+        let indicators: [UIView] = [spinner, failureIcon]
         for indicator in indicators {
             indicator.isUserInteractionEnabled = false
             indicator.translatesAutoresizingMaskIntoConstraints = false
@@ -642,7 +651,9 @@ final class DemoKeyboardViewController: UIInputViewController {
         nextKeyboardButton.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
 
         returnButton.titleLabel?.font = .preferredFont(forTextStyle: .subheadline)
-        returnButton.layer.cornerRadius = 10
+        returnButton.layer.cornerRadius = Panel.keyCornerRadius
+        deleteButton.layer.cornerRadius = Panel.keyCornerRadius
+        deleteButton.backgroundColor = .secondarySystemBackground
         returnButton.contentEdgeInsets = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
         returnButton.addTarget(self, action: #selector(pressReturn), for: .touchUpInside)
 
@@ -668,11 +679,11 @@ final class DemoKeyboardViewController: UIInputViewController {
             gestureHint.centerYAnchor.constraint(equalTo: meter.centerYAnchor),
             gestureHint.widthAnchor.constraint(equalToConstant: 160),
             meter.centerXAnchor.constraint(equalTo: dictateButton.centerXAnchor),
-            meter.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+            meter.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
             meter.widthAnchor.constraint(equalToConstant: Panel.meterSize.width),
             meter.heightAnchor.constraint(equalToConstant: Panel.meterSize.height),
 
-            dictateButton.topAnchor.constraint(equalTo: meter.bottomAnchor, constant: 8),
+            dictateButton.topAnchor.constraint(equalTo: meter.bottomAnchor, constant: 12),
             dictateButton.centerXAnchor.constraint(equalTo: safeArea.centerXAnchor),
             dictateButton.widthAnchor.constraint(equalToConstant: Panel.voiceDiameter),
             dictateButton.heightAnchor.constraint(equalTo: dictateButton.widthAnchor),
@@ -681,9 +692,8 @@ final class DemoKeyboardViewController: UIInputViewController {
             returnButton.widthAnchor.constraint(greaterThanOrEqualToConstant: Panel.actionWidth),
             returnButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
 
-            deleteButton.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
-            deleteButton.leadingAnchor.constraint(equalTo: returnButton.leadingAnchor),
-            deleteButton.trailingAnchor.constraint(equalTo: returnButton.trailingAnchor),
+            deleteButton.topAnchor.constraint(equalTo: meter.topAnchor),
+            deleteButton.widthAnchor.constraint(equalToConstant: Panel.deleteWidth),
             deleteButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
 
             nextKeyboardButton.centerYAnchor.constraint(equalTo: returnButton.centerYAnchor),
@@ -702,12 +712,14 @@ final class DemoKeyboardViewController: UIInputViewController {
         switch hand {
         case .left:
             handConstraints = [
+                deleteButton.leftAnchor.constraint(equalTo: returnButton.leftAnchor),
                 returnButton.leftAnchor.constraint(equalTo: safeArea.leftAnchor, constant: Panel.sideInset),
                 returnButton.rightAnchor.constraint(lessThanOrEqualTo: dictateButton.leftAnchor, constant: -8),
                 nextKeyboardButton.rightAnchor.constraint(equalTo: safeArea.rightAnchor, constant: -Panel.sideInset),
             ]
         case .right:
             handConstraints = [
+                deleteButton.rightAnchor.constraint(equalTo: returnButton.rightAnchor),
                 returnButton.rightAnchor.constraint(equalTo: safeArea.rightAnchor, constant: -Panel.sideInset),
                 returnButton.leftAnchor.constraint(greaterThanOrEqualTo: dictateButton.rightAnchor, constant: 8),
                 nextKeyboardButton.leftAnchor.constraint(equalTo: safeArea.leftAnchor, constant: Panel.sideInset),
@@ -738,10 +750,9 @@ final class DemoKeyboardViewController: UIInputViewController {
     }
 
     private func refreshTheme() {
-        view.backgroundColor = Panel.panelColor
+        view.backgroundColor = .clear
         nextKeyboardButton.tintColor = .label
         deleteButton.tintColor = .label
-        microphoneIcon.tintColor = .secondaryLabel
         failureIcon.tintColor = .secondaryLabel
         wave.strokeColor = UIColor.secondaryLabel.resolvedColor(with: traitCollection).cgColor
         updateReturnButton()
@@ -799,7 +810,6 @@ final class DemoKeyboardViewController: UIInputViewController {
         spinner.color = .white
         if waiting { spinner.startAnimating() } else { spinner.stopAnimating() }
         failureIcon.isHidden = recording != nil || waiting || failureMessage == nil
-        microphoneIcon.isHidden = waiting || !failureIcon.isHidden
         dictateButton.accessibilityValue = recording != nil ? "录音中，上滑取消" : waiting ? "正在转写" : failureMessage
     }
 

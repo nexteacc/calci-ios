@@ -36,14 +36,8 @@ struct ContentView: View {
             }
 
             Section {
-                Picker("操作手", selection: Binding(get: { keyboardHand }, set: { hand in
-                    layoutError = !hand.save()
-                    if !layoutError { keyboardHand = hand }
-                })) {
-                    Text("左手").tag(KeyboardHand.left)
-                    Text("右手").tag(KeyboardHand.right)
-                }
-                .pickerStyle(.segmented)
+                Toggle("左手", isOn: layoutSelection(.left)).toggleStyle(.switch).tint(.green)
+                Toggle("右手", isOn: layoutSelection(.right)).toggleStyle(.switch).tint(.green)
                 if layoutError { Text("布局未保存，请重试。") }
             } header: {
                 stepTitle("键盘布局")
@@ -92,6 +86,18 @@ struct ContentView: View {
             guard scenePhase == .active else { return }
             microphone = AVAudioApplication.shared.recordPermission
         }
+    }
+
+    private func layoutSelection(_ hand: KeyboardHand) -> Binding<Bool> {
+        Binding(
+            get: { keyboardHand == hand },
+            set: { enabled in
+                let selected: KeyboardHand = enabled ? hand : (hand == .left ? .right : .left)
+                guard selected != keyboardHand else { return }
+                layoutError = !selected.save()
+                if !layoutError { keyboardHand = selected }
+            }
+        )
     }
 
     private func stepTitle(_ title: String) -> some View {

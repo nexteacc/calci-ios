@@ -19,6 +19,7 @@ final class WebAudioCapture: NSObject {
     private(set) var isCapturing = false
     private let webView: WKWebView
     private var heartbeat: Timer?
+    private var captureID: String?
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -45,12 +46,19 @@ final class WebAudioCapture: NSObject {
 
     func start(rate: Int) {
         guard isReady, !isCapturing else { return }
+        let id = UUID().uuidString
+        captureID = id
         isCapturing = true
         heartbeat = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.webView.evaluateJavaScript("captureHeartbeat()") }
         }
-        webView.evaluateJavaScript("startCapture(\(rate)); 0") { [weak self] _, error in
-            if let error { Task { @MainActor in self?.finish(reason: "start failed: \(error.localizedDescription)") } }
+        webView.evaluateJavaScript("startCapture(\(rate), '\(id)'); 0") { [weak self] _, error in
+            if let error {
+                Task { @MainActor in
+                    guard let self, self.captureID == id else { return }
+                    self.finish(reason: "start failed: \(error.localizedDescription)")
+                }
+            }
         }
     }
 
@@ -72,11 +80,13 @@ final class WebAudioCapture: NSObject {
         heartbeat = nil
         guard isCapturing else { return }
         isCapturing = false
+        captureID = nil
         onEnded?(reason)
     }
 
     fileprivate func handle(_ body: Any) {
         guard let message = body as? [String: Any], let type = message["type"] as? String else { return }
+        guard type == "ready" || (isCapturing && message["id"] as? String == captureID) else { return }
         switch type {
         case "ready":
             isReady = true
@@ -107,7 +117,8 @@ final class WebAudioCapture: NSObject {
     window.captureHeartbeat = () => { lastHeartbeat = performance.now(); };
     let stopCapture = () => {};
     window.stopCapture = () => stopCapture();
-    window.startCapture = async (targetRate) => {
+    window.startCapture = async (targetRate, id) => {
+      const emit = message => post({ ...message, id });
       let stopping = false, stream, context, source, processor, sink, watchdog;
       const audioSession = navigator.audioSession;
       const previousType = audioSession?.type ?? 'auto';
@@ -119,10 +130,11 @@ final class WebAudioCapture: NSObject {
         source?.disconnect();
         sink?.disconnect();
         stream?.getTracks().forEach(track => track.stop());
+        if (audioSession) audioSession.onstatechange = null;
         context?.close().catch(() => {});
         try { if (audioSession) audioSession.type = previousType; } catch (_) {}
       };
-      const interrupted = reason => { if (!stopping) { cleanup(); post({ type: 'interrupted', reason }); } };
+      const interrupted = reason => { if (!stopping) { cleanup(); emit({ type: 'interrupted', reason }); } };
       stopCapture = cleanup;
       try {
         try { if (audioSession) audioSession.type = 'play-and-record'; } catch (_) {}
@@ -135,6 +147,7 @@ final class WebAudioCapture: NSObject {
         // Defer the AudioContext until capture: creating one can take audio focus.
         context = new AudioContext({ latencyHint: 'interactive' });
         await context.resume();
+        if (stopping) return;
         processor = context.createScriptProcessor(1024, 1, 1);
         sink = context.createGain();
         sink.gain.value = 0;
@@ -154,6 +167,7 @@ final class WebAudioCapture: NSObject {
         const step = context.sampleRate / targetRate;
         let position = 0, sum = 0, count = 0;
         processor.onaudioprocess = event => {
+          if (stopping) return;
           const input = event.inputBuffer.getChannelData(0);
           const output = new Int16Array(Math.ceil(input.length / step) + 1);
           let written = 0, energy = 0;
@@ -166,13 +180,13 @@ final class WebAudioCapture: NSObject {
             }
           }
           analyser.getByteFrequencyData(bins);
-          if (written > 0) post({ type: 'audio', data: encode(output.subarray(0, written)), bands: Array.from({length: 12}, (_, i) => bins[6 + Math.floor(i * 45 / 12)]) });
+          if (written > 0) emit({ type: 'audio', data: encode(output.subarray(0, written)), bands: Array.from({length: 12}, (_, i) => bins[6 + Math.floor(i * 45 / 12)]) });
         };
-        post({ type: 'started', sampleRate: context.sampleRate });
+        emit({ type: 'started', sampleRate: context.sampleRate });
       } catch (error) {
         if (stopping) return;
         cleanup();
-        post({ type: 'failed', reason: error.name + ': ' + error.message });
+        emit({ type: 'failed', reason: error.name + ': ' + error.message });
       }
     };
     post({ type: 'ready' });
