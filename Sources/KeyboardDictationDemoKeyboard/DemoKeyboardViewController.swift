@@ -21,9 +21,39 @@ private func trace(_ message: String) {
 
 @objc(DemoKeyboardViewController)
 final class DemoKeyboardViewController: UIInputViewController {
+    // Dimensions of the compact panel, excluding the iOS strip below it.
+    private enum Panel {
+        static let height: CGFloat = 144
+        static let sideInset: CGFloat = 12
+        static let voiceDiameter: CGFloat = 82
+        static let meterSize = CGSize(width: 76, height: 24)
+        static let actionHeight: CGFloat = 44
+        static let actionWidth: CGFloat = 70
+        static let panelColor = UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(red: 0.16, green: 0.18, blue: 0.22, alpha: 1)
+                : UIColor(red: 0.84, green: 0.87, blue: 0.92, alpha: 1)
+        }
+        static let voiceColor = UIColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? UIColor(white: 0.25, alpha: 1)
+                : UIColor(red: 0.97, green: 0.97, blue: 0.98, alpha: 1)
+        }
+        static let sendColor = UIColor(red: 0.18, green: 0.41, blue: 0.98, alpha: 1)
+    }
+
     private let capture = WebAudioCapture()
     private let dictateButton = UIButton(type: .custom)
+    private let microphoneIcon = UIImageView(image: UIImage(
+        systemName: "mic.fill",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 31, weight: .medium)
+    ))
     private let meter = UIView()
+    private let gestureHint = UILabel()
+    private var isDictationTouchDown = false
+    private var holdOrigin = CGPoint.zero
+    private var recordingDocument: UUID?
+    private var deletingFromHold = false
     private let wave = CAShapeLayer()
     private let waveFade = CAGradientLayer()
     private let spinner = UIActivityIndicatorView(style: .medium)
@@ -57,6 +87,7 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        hasDictationKey = true
         trace("keyboard loaded")
         configureView()
         capture.onReady = { [weak self] in trace("web capture ready"); self?.render() }
@@ -80,6 +111,7 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        isDictationTouchDown = false
         stopRepeatingDelete()
         discardStandby()
         standbyState = "keyboard-hidden"
@@ -112,9 +144,33 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     // MARK: - Dictation
 
+    @objc private func beginDictationTouch() {
+        guard recording == nil, !isDictationTouchDown else { return }
+        isDictationTouchDown = true
+        // A small pulse acknowledges the touch before any audio is captured.
+        drawMeter([4, 8, 20, 39, 56, 46, 28, 18, 10, 6, 4, 2])
+        if !UIAccessibility.isReduceMotionEnabled {
+            let pulse = CABasicAnimation(keyPath: "transform.scale.y")
+            pulse.fromValue = 0.35
+            pulse.toValue = 1
+            pulse.duration = 0.14
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            wave.add(pulse, forKey: "touchPulse")
+        }
+    }
+
+    @objc private func endDictationTouch() {
+        isDictationTouchDown = false
+        updateMeterVisibility()
+    }
+
     @objc private func holdToDictate(_ gesture: UILongPressGestureRecognizer) {
         switch gesture.state {
         case .began:
+            isDictationTouchDown = false
+            defer { updateMeterVisibility() }
+            stopRepeatingDelete()
+            holdOrigin = gesture.location(in: view)
             trace("hold began ready=\(capture.isReady) capturing=\(capture.isCapturing) pending=\(turns.count)")
             guard capture.isReady, !capture.isCapturing, recording == nil else { return }
             startDictation()
@@ -122,16 +178,44 @@ final class DemoKeyboardViewController: UIInputViewController {
                 pressFeedback.impactOccurred()
                 releaseFeedback.prepare()
             }
+        case .changed:
+            guard recording != nil else { return }
+            // Sideways movement and small shifts are normal while holding.
+            let distance = holdOrigin.y - gesture.location(in: view).y
+            if distance >= 64 {
+                cancelDictation()
+                releaseFeedback.impactOccurred()
+            }
         case .ended:
             guard capture.isCapturing else { return }
             stopDictation()
             releaseFeedback.impactOccurred()
             pressFeedback.prepare()
         case .cancelled, .failed:
-            if let turn = recording { finish(turn) }
+            endDictationTouch()
+            cancelDictation()
         default:
             break
         }
+    }
+
+    private func cancelDictation() {
+        guard let turn = recording else { return }
+        pendingSendDocument = nil
+        // Only the first turn can have inserted a partial result. Never delete
+        // text after the user moved the cursor or switched to another document.
+        if turns.first === turn {
+            guard recordingDocument == textDocumentProxy.documentIdentifier,
+                  textDocumentProxy.documentContextBeforeInput == expectedContext else {
+                finishRecognition()
+                return
+            }
+            replacePartial(with: "")
+        }
+        turn.text = ""
+        finish(turn)
+        prepareStandby()
+        UIAccessibility.post(notification: .announcement, argument: "已取消")
     }
 
     private var standbyState = "none"
@@ -184,7 +268,6 @@ final class DemoKeyboardViewController: UIInputViewController {
         }
         failureClear?.cancel()
         failureMessage = nil
-        wave.removeAllAnimations()
         capturedBytes = 0
         let preflight = standbyState
         let age = Int((ProcessInfo.processInfo.systemUptime - standbySince) * 1000)
@@ -197,6 +280,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         if turns.isEmpty { expectedContext = textDocumentProxy.documentContextBeforeInput }
         turn.connection = connection
         trace("turn=\(turn.id) connection=\(connection.id) hold accepted standby=\(preflight) msSinceStandbyStart=\(age)")
+        recordingDocument = textDocumentProxy.documentIdentifier
         recording = turn
         updateFeedback()
         turns.append(turn)
@@ -375,47 +459,70 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     // MARK: - UI
 
+    @objc private func beginDeleteTouch() {
+        stopRepeatingDelete()
+        deletingFromHold = false
+    }
+
     @objc private func pressDelete() {
-        guard !capture.isCapturing, turns.isEmpty else { return }
+        guard !deletingFromHold, !capture.isCapturing, turns.isEmpty else { return }
         stopRepeatingDelete()
         textDocumentProxy.deleteBackward()
     }
 
     @objc private func holdDelete(_ gesture: UILongPressGestureRecognizer) {
-        guard gesture.state == .began, !capture.isCapturing, turns.isEmpty else { return }
-        stopRepeatingDelete()
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        let document = textDocumentProxy.documentIdentifier
-        clearTextTask = Task { @MainActor [weak self] in
-            // The host exposes context in chunks. Move to the end before deleting,
-            // so a cursor in the middle does not leave the suffix behind.
-            let deadline = Date().addingTimeInterval(5)
-            var operations = 0
-            while let self, !Task.isCancelled, Date() < deadline,
-                  self.textDocumentProxy.documentIdentifier == document,
-                  !self.capture.isCapturing, self.turns.isEmpty,
-                  let suffix = self.textDocumentProxy.documentContextAfterInput,
-                  !suffix.isEmpty, operations < 1000 {
-                self.textDocumentProxy.adjustTextPosition(byCharacterOffset: suffix.count)
-                operations += 1
-                try? await Task.sleep(nanoseconds: 20_000_000)
+        switch gesture.state {
+        case .began:
+            guard !capture.isCapturing, turns.isEmpty else { return }
+            stopRepeatingDelete()
+            deletingFromHold = true
+            let document = textDocumentProxy.documentIdentifier
+            clearTextTask = Task { @MainActor [weak self] in
+                let started = ProcessInfo.processInfo.systemUptime
+                var clearing = false
+                var emptyPasses = 0
+                // Bound the operation even when a host does not expose its text.
+                for _ in 0..<3000 {
+                    guard let self, !Task.isCancelled,
+                          self.textDocumentProxy.documentIdentifier == document,
+                          !self.capture.isCapturing, self.turns.isEmpty else { return }
+                    let proxy = self.textDocumentProxy
+                    if !clearing && ProcessInfo.processInfo.systemUptime - started >= 1.2 {
+                        clearing = true
+                        self.gestureHint.text = "正在清空"
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    }
+                    if clearing, let suffix = proxy.documentContextAfterInput, !suffix.isEmpty {
+                        // Context may contain only one paragraph. Re-read after
+                        // each move so text beyond that paragraph is included.
+                        proxy.adjustTextPosition(byCharacterOffset: suffix.utf16.count)
+                        try? await Task.sleep(for: .milliseconds(40))
+                        continue
+                    }
+                    let empty = !proxy.hasText && (proxy.documentContextBeforeInput ?? "").isEmpty
+                    emptyPasses = empty ? emptyPasses + 1 : 0
+                    if emptyPasses >= 12 { break }
+                    // Do not stop on a single empty context: hosts can briefly
+                    // expose no text at a paragraph boundary or during refresh.
+                    let batch = clearing ? min(24, max(1, proxy.documentContextBeforeInput?.count ?? 0)) : 1
+                    for _ in 0..<batch { proxy.deleteBackward() }
+                    try? await Task.sleep(for: .milliseconds(clearing ? 40 : 80))
+                }
+                self?.gestureHint.text = ""
             }
-            var deleted = 0
-            while let self, !Task.isCancelled, Date() < deadline,
-                  self.textDocumentProxy.documentIdentifier == document,
-                  !self.capture.isCapturing, self.turns.isEmpty,
-                  self.textDocumentProxy.hasText, deleted < 100_000 {
-                let count = min(100, max(1, self.textDocumentProxy.documentContextBeforeInput?.count ?? 0))
-                for _ in 0..<count { self.textDocumentProxy.deleteBackward() }
-                deleted += count
-                try? await Task.sleep(nanoseconds: 20_000_000)
-            }
+            gestureHint.text = "继续按住清空"
+        case .ended, .cancelled, .failed:
+            stopRepeatingDelete()
+            // Keep suppressing touchUpInside for this release. The next
+            // touchDown resets the flag before a new tap or hold.
+        default: break
         }
     }
 
     private func stopRepeatingDelete() {
         clearTextTask?.cancel()
         clearTextTask = nil
+        gestureHint.text = ""
     }
 
     @objc private func pressReturn() {
@@ -449,15 +556,19 @@ final class DemoKeyboardViewController: UIInputViewController {
         returnButton.accessibilityLabel = title
         returnButton.tintColor = isSubmission ? .white : .label
         returnButton.setTitleColor(isSubmission ? .white : .label, for: .normal)
-        returnButton.backgroundColor = isSubmission ? .systemBlue : .secondarySystemBackground
+        returnButton.backgroundColor = isSubmission ? Panel.sendColor : .secondarySystemBackground
         returnButton.isEnabled = (recording == nil && !turns.isEmpty && textDocumentProxy.returnKeyType == .send) || textDocumentProxy.enablesReturnKeyAutomatically != true || textDocumentProxy.hasText
         returnButton.alpha = returnButton.isEnabled ? 1 : 0.5
     }
 
     private func configureView() {
-        wave.frame = CGRect(x: 0, y: 0, width: 120, height: 32)
+        gestureHint.font = .preferredFont(forTextStyle: .caption1)
+        gestureHint.textAlignment = .center
+        gestureHint.textColor = .secondaryLabel
+        gestureHint.isUserInteractionEnabled = false
+        wave.frame = CGRect(origin: .zero, size: Panel.meterSize)
         wave.fillColor = nil
-        wave.lineWidth = 2.8
+        wave.lineWidth = 2
         wave.lineCap = .round
         meter.isUserInteractionEnabled = false
         meter.accessibilityElementsHidden = true
@@ -470,7 +581,8 @@ final class DemoKeyboardViewController: UIInputViewController {
         waveFade.endPoint = CGPoint(x: 1, y: 0.5)
         meter.layer.mask = waveFade
         refreshTheme()
-        for indicator in [spinner, failureIcon] {
+        let indicators: [UIView] = [microphoneIcon, spinner, failureIcon]
+        for indicator in indicators {
             indicator.isUserInteractionEnabled = false
             indicator.translatesAutoresizingMaskIntoConstraints = false
             dictateButton.addSubview(indicator)
@@ -479,13 +591,18 @@ final class DemoKeyboardViewController: UIInputViewController {
         }
         failureIcon.tintColor = .secondaryLabel
         updateFeedback()
-        dictateButton.layer.cornerRadius = 32
-        dictateButton.layer.borderWidth = 2
+        dictateButton.layer.cornerRadius = Panel.voiceDiameter / 2
+        dictateButton.layer.shadowColor = UIColor.black.cgColor
+        dictateButton.layer.shadowOpacity = 0.14
+        dictateButton.layer.shadowRadius = 4
+        dictateButton.layer.shadowOffset = CGSize(width: 0, height: 2)
         dictateButton.accessibilityLabel = "按住说话"
-        dictateButton.layer.borderColor = UIColor.separator.resolvedColor(with: traitCollection).cgColor
+        dictateButton.addTarget(self, action: #selector(beginDictationTouch), for: .touchDown)
+        dictateButton.addTarget(self, action: #selector(endDictationTouch), for: [.touchUpInside, .touchUpOutside, .touchCancel])
         pressFeedback.prepare()
         let hold = UILongPressGestureRecognizer(target: self, action: #selector(holdToDictate(_:)))
         hold.minimumPressDuration = 0.12
+        hold.allowableMovement = .greatestFiniteMagnitude
         dictateButton.addGestureRecognizer(hold)
 
         nextKeyboardButton.accessibilityLabel = "切换键盘"
@@ -493,53 +610,56 @@ final class DemoKeyboardViewController: UIInputViewController {
         nextKeyboardButton.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
 
         returnButton.titleLabel?.font = .preferredFont(forTextStyle: .subheadline)
-        returnButton.layer.cornerRadius = 7
+        returnButton.layer.cornerRadius = 10
         returnButton.contentEdgeInsets = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 12)
         returnButton.addTarget(self, action: #selector(pressReturn), for: .touchUpInside)
 
         deleteButton.setImage(UIImage(systemName: "delete.left"), for: .normal)
         deleteButton.accessibilityLabel = "删除"
-        deleteButton.accessibilityHint = "轻点删除一个字，长按清空输入框"
+        deleteButton.accessibilityHint = "轻点删除一个字，按住连续删除，继续按住清空输入框"
         deleteButton.tintColor = .label
-        deleteButton.backgroundColor = .secondarySystemBackground
-        deleteButton.layer.cornerRadius = 7
+        deleteButton.addTarget(self, action: #selector(beginDeleteTouch), for: .touchDown)
         deleteButton.addTarget(self, action: #selector(pressDelete), for: .touchUpInside)
         let deleteHold = UILongPressGestureRecognizer(target: self, action: #selector(holdDelete(_:)))
-        deleteHold.minimumPressDuration = 0.7
+        deleteHold.minimumPressDuration = 0.4
         deleteButton.addGestureRecognizer(deleteHold)
 
-        for subview in [dictateButton, meter, nextKeyboardButton, returnButton, deleteButton] {
+        for subview in [dictateButton, meter, gestureHint, nextKeyboardButton, returnButton, deleteButton] {
             subview.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(subview)
         }
-        let margins = view.layoutMarginsGuide
+        let safeArea = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
+            // Size the extension's root view so the host gets back the space.
+            view.heightAnchor.constraint(equalToConstant: Panel.height),
+            gestureHint.centerXAnchor.constraint(equalTo: meter.centerXAnchor),
+            gestureHint.centerYAnchor.constraint(equalTo: meter.centerYAnchor),
+            gestureHint.widthAnchor.constraint(equalToConstant: 160),
             meter.centerXAnchor.constraint(equalTo: dictateButton.centerXAnchor),
-            meter.topAnchor.constraint(equalTo: margins.topAnchor, constant: 8),
-            meter.widthAnchor.constraint(equalToConstant: 120),
-            meter.heightAnchor.constraint(equalToConstant: 32),
+            meter.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+            meter.widthAnchor.constraint(equalToConstant: Panel.meterSize.width),
+            meter.heightAnchor.constraint(equalToConstant: Panel.meterSize.height),
 
-            dictateButton.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            dictateButton.centerXAnchor.constraint(equalTo: margins.centerXAnchor),
-            dictateButton.widthAnchor.constraint(equalToConstant: 64),
-            dictateButton.heightAnchor.constraint(equalToConstant: 64),
+            dictateButton.topAnchor.constraint(equalTo: meter.bottomAnchor, constant: 8),
+            dictateButton.centerXAnchor.constraint(equalTo: safeArea.centerXAnchor),
+            dictateButton.widthAnchor.constraint(equalToConstant: Panel.voiceDiameter),
+            dictateButton.heightAnchor.constraint(equalTo: dictateButton.widthAnchor),
 
-            returnButton.trailingAnchor.constraint(equalTo: margins.trailingAnchor),
-            returnButton.bottomAnchor.constraint(equalTo: margins.bottomAnchor, constant: -8),
-            returnButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
-            returnButton.heightAnchor.constraint(equalToConstant: 44),
+            returnButton.trailingAnchor.constraint(equalTo: safeArea.trailingAnchor, constant: -Panel.sideInset),
+            returnButton.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
+            returnButton.widthAnchor.constraint(greaterThanOrEqualToConstant: Panel.actionWidth),
+            returnButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
             returnButton.leadingAnchor.constraint(greaterThanOrEqualTo: dictateButton.trailingAnchor, constant: 8),
 
-            deleteButton.topAnchor.constraint(equalTo: margins.topAnchor, constant: 8),
+            deleteButton.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
             deleteButton.leadingAnchor.constraint(equalTo: returnButton.leadingAnchor),
             deleteButton.trailingAnchor.constraint(equalTo: returnButton.trailingAnchor),
-            deleteButton.heightAnchor.constraint(equalToConstant: 44),
+            deleteButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
 
-            nextKeyboardButton.leadingAnchor.constraint(equalTo: margins.leadingAnchor),
-            nextKeyboardButton.bottomAnchor.constraint(equalTo: returnButton.bottomAnchor),
+            nextKeyboardButton.leadingAnchor.constraint(equalTo: safeArea.leadingAnchor, constant: Panel.sideInset),
+            nextKeyboardButton.centerYAnchor.constraint(equalTo: returnButton.centerYAnchor),
             nextKeyboardButton.widthAnchor.constraint(equalToConstant: 44),
-            nextKeyboardButton.heightAnchor.constraint(equalToConstant: 36),
-
+            nextKeyboardButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
         ])
     }
 
@@ -565,27 +685,33 @@ final class DemoKeyboardViewController: UIInputViewController {
     }
 
     private func refreshTheme() {
-        view.backgroundColor = .clear
+        view.backgroundColor = Panel.panelColor
         nextKeyboardButton.tintColor = .label
         deleteButton.tintColor = .label
-        deleteButton.backgroundColor = .secondarySystemBackground
+        microphoneIcon.tintColor = .secondaryLabel
         failureIcon.tintColor = .secondaryLabel
-        dictateButton.layer.borderColor = UIColor.separator.resolvedColor(with: traitCollection).cgColor
-        wave.strokeColor = UIColor.label.resolvedColor(with: traitCollection).cgColor
+        wave.strokeColor = UIColor.secondaryLabel.resolvedColor(with: traitCollection).cgColor
         updateReturnButton()
         updateFeedback()
     }
 
     private func updateMeter(_ bands: [UInt8]) {
         guard recording != nil, bands.count == 12 else { return }
+        wave.removeAnimation(forKey: "touchPulse")
+        drawMeter(bands)
+    }
+
+    private func drawMeter(_ bands: [UInt8]) {
         let path = UIBezierPath()
+        let spacing = Panel.meterSize.width / 24
+        let centerY = Panel.meterSize.height / 2
         for i in 0..<24 {
             let band = i < 12 ? 11 - i : i - 12
             let level = min(1, CGFloat(bands[band]) / 255 * 1.5)
-            let x = CGFloat(i) * 5 + 2.5
-            let halfHeight = max(0.2, level * 12.8)
-            path.move(to: CGPoint(x: x, y: 16 - halfHeight))
-            path.addLine(to: CGPoint(x: x, y: 16 + halfHeight))
+            let x = (CGFloat(i) + 0.5) * spacing
+            let halfHeight = max(0.2, level * (centerY - 2))
+            path.move(to: CGPoint(x: x, y: centerY - halfHeight))
+            path.addLine(to: CGPoint(x: x, y: centerY + halfHeight))
         }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -607,18 +733,21 @@ final class DemoKeyboardViewController: UIInputViewController {
         updateFeedback()
     }
 
+    private func updateMeterVisibility() {
+        wave.isHidden = !isDictationTouchDown && recording == nil
+        if wave.isHidden { wave.removeAllAnimations() }
+    }
+
     private func updateFeedback() {
         updateReturnButton()
-        wave.isHidden = recording == nil || capturedBytes == 0
-        if recording == nil { wave.removeAllAnimations() }
+        updateMeterVisibility()
         let waiting = recording == nil && turns.contains { !$0.done }
-        let restingColor: UIColor = traitCollection.userInterfaceStyle == .dark ? .white : .secondarySystemBackground
-        dictateButton.backgroundColor = waiting ? .systemRed : restingColor
-        failureIcon.tintColor = traitCollection.userInterfaceStyle == .dark ? .darkGray : .secondaryLabel
+        dictateButton.backgroundColor = waiting ? .systemRed : Panel.voiceColor
         spinner.color = .white
         if waiting { spinner.startAnimating() } else { spinner.stopAnimating() }
         failureIcon.isHidden = recording != nil || waiting || failureMessage == nil
-        dictateButton.accessibilityValue = recording != nil ? "录音中" : waiting ? "正在转写" : failureMessage
+        microphoneIcon.isHidden = waiting || !failureIcon.isHidden
+        dictateButton.accessibilityValue = recording != nil ? "录音中，上滑取消" : waiting ? "正在转写" : failureMessage
     }
 
     private func render() {
