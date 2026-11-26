@@ -14,6 +14,8 @@ struct ContentView: View {
     @State private var keyboardHand = KeyboardHand.read()
     @State private var layoutError = false
 
+    @State private var provider = APIKeyStore.read("Calci.Provider") ?? "OpenAI"
+
     var body: some View {
         Form {
             Section {
@@ -48,21 +50,27 @@ struct ContentView: View {
             }
 
             Section {
-                Picker("服务", selection: .constant("OpenAI")) {
+                Picker("服务", selection: $provider) {
                     Text("OpenAI").tag("OpenAI")
+                    Text("豆包").tag("Doubao")
                 }.pickerStyle(.menu)
+                .onChange(of: provider, initial: true) {
+                    key = ""
+                    keyError = !APIKeyStore.save(provider, "Calci.Provider")
+                    saved = APIKeyStore.read("Calci." + provider) != nil
+                }
                 SecureField(saved ? "输入新密钥" : "输入 API 密钥", text: $key)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                 if !key.isEmpty {
                     Button("保存密钥") {
                         let value = key.trimmingCharacters(in: .whitespacesAndNewlines)
-                        keyError = value.isEmpty || !APIKeyStore.save(value)
+                        keyError = value.isEmpty || !APIKeyStore.save(value, "Calci." + provider)
                         if !keyError { saved = true; key = "" }
                     }
                 } else if saved {
                     Button("移除已保存的密钥", role: .destructive) {
-                        keyError = !APIKeyStore.remove()
+                        keyError = !APIKeyStore.remove("Calci." + provider)
                         if !keyError { saved = false }
                     }
                 }

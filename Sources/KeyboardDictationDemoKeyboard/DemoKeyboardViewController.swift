@@ -1,3 +1,4 @@
+import zlib
 import AVFoundation
 import OSLog
 #if SWIFT_PACKAGE
@@ -233,7 +234,8 @@ final class DemoKeyboardViewController: UIInputViewController {
     }
 
     private func prepareStandby() {
-        guard standby == nil, hasFullAccess, AVAudioApplication.shared.recordPermission == .granted,
+        let provider = APIKeyStore.read("Calci.Provider") ?? "OpenAI"
+        guard provider == "OpenAI", standby == nil, hasFullAccess, AVAudioApplication.shared.recordPermission == .granted,
               let key = APIKeyStore.read(), !key.isEmpty else { return }
         let candidate = PreparedConnection(key: key)
         standbyState = "connecting"
@@ -265,8 +267,11 @@ final class DemoKeyboardViewController: UIInputViewController {
             log.error("Keyboard or microphone permission missing")
             return
         }
-        guard let key = APIKeyStore.read(), !key.isEmpty else {
-            trace("OpenAI key unavailable")
+        let provider = APIKeyStore.read("Calci.Provider") ?? "OpenAI"
+        let doubao = provider == "Doubao"
+        if doubao { discardStandby() }
+        guard let key = APIKeyStore.read("Calci." + provider), !key.isEmpty else {
+            showFailure("请先保存服务密钥")
             return
         }
         failureClear?.cancel()
@@ -275,14 +280,14 @@ final class DemoKeyboardViewController: UIInputViewController {
         let preflight = standbyState
         let age = Int((ProcessInfo.processInfo.systemUptime - standbySince) * 1000)
         standbyState = "consumed"
-        let connection = standby ?? PreparedConnection(key: key)
+        let connection = standby ?? PreparedConnection(key: key, doubao: doubao)
         standby = nil
         idleTimeout?.cancel()
         let (frames, continuation) = AsyncStream<Data>.makeStream()
         let turn = Turn(continuation)
         if turns.isEmpty { expectedContext = textDocumentProxy.documentContextBeforeInput }
         turn.connection = connection
-        trace("turn=\(turn.id) connection=\(connection.id) hold accepted standby=\(preflight) msSinceStandbyStart=\(age)")
+        trace("turn=\(turn.id) connection=\(connection.id) hold accepted provider=\(provider) standby=\(preflight) msSinceStandbyStart=\(age)")
         recordingDocument = textDocumentProxy.documentIdentifier
         recording = turn
         updateFeedback()
@@ -303,7 +308,7 @@ final class DemoKeyboardViewController: UIInputViewController {
                         guard e.domain == NSURLErrorDomain, retryable.contains(e.code) else { throw error }
                         connection.close()
                         try await Task.sleep(for: .milliseconds(200))
-                        let retry = PreparedConnection(key: key)
+                        let retry = PreparedConnection(key: key, doubao: doubao)
                         turn.connection = retry
                         trace("turn=\(turn.id) retry connection=\(retry.id)")
                         try await retry.ready.value
@@ -311,11 +316,17 @@ final class DemoKeyboardViewController: UIInputViewController {
                     guard let socket = turn.connection?.socket else { throw CancellationError() }
                     try Task.checkCancellation()
                     trace("turn=\(turn.id) sender ready")
-                    sender = Task { try await Self.sendAudio(frames, over: socket, turnID: String(turn.id)) }
+                    sender = Task { try await Self.sendAudio(frames, over: socket, turnID: String(turn.id), doubao: doubao) }
                     while !Task.isCancelled {
                         let message = try await socket.receive()
-                        guard case let .string(payload) = message else { continue }
-                        let event = try JSONDecoder().decode(TranscriptionEvent.self, from: Data(payload.utf8))
+                        let event: TranscriptionEvent
+                        if doubao {
+                            guard case let .data(frame) = message else { throw URLError(.cannotParseResponse) }
+                            event = try DoubaoWire.decode(frame)
+                        } else {
+                            guard case let .string(payload) = message else { continue }
+                            event = try JSONDecoder().decode(TranscriptionEvent.self, from: Data(payload.utf8))
+                        }
                         guard let self, !Task.isCancelled, !turn.done else { break }
                         guard self.textDocumentProxy.documentIdentifier == document else { self.finishRecognition(); break }
                         guard self.textDocumentProxy.documentContextBeforeInput == self.expectedContext else {
@@ -324,6 +335,12 @@ final class DemoKeyboardViewController: UIInputViewController {
                             break
                         }
                         switch event.type {
+                        case "snapshot":
+                            if let text = event.transcript {
+                                if turn.text.isEmpty && !text.isEmpty { trace("turn=\(turn.id) first delta") }
+                                turn.text = text
+                                self.flushTurns()
+                            }
                         case "conversation.item.input_audio_transcription.delta":
                             if let delta = event.delta { if turn.text.isEmpty { trace("turn=\(turn.id) first delta") }; turn.text += delta; self.flushTurns() }
                         case "conversation.item.input_audio_transcription.completed":
@@ -350,22 +367,34 @@ final class DemoKeyboardViewController: UIInputViewController {
                 connection.close()
             }
         }
-        capture.start()
+        capture.start(rate: doubao ? 16000 : 24000)
     }
 
-    nonisolated private static func sendAudio(_ frames: AsyncStream<Data>, over socket: URLSessionWebSocketTask, turnID: String) async throws {
+    nonisolated private static func sendAudio(_ frames: AsyncStream<Data>, over socket: URLSessionWebSocketTask, turnID: String, doubao: Bool) async throws {
         do {
             var sentFirst = false
+            var buffered = Data()
             for await frame in frames {
                 try Task.checkCancellation()
-                try await socket.send(.string(#"{"type":"input_audio_buffer.append","audio":""# + frame.base64EncodedString() + #""}"#))
+                if doubao {
+                    buffered.append(frame)
+                    guard buffered.count >= 6400 else { continue }
+                    try await socket.send(.data(DoubaoWire.frame(0x20, buffered)))
+                    buffered.removeAll(keepingCapacity: true)
+                } else {
+                    try await socket.send(.string(#"{"type":"input_audio_buffer.append","audio":""# + frame.base64EncodedString() + #""}"#))
+                }
                 if !sentFirst {
                     sentFirst = true
                     await MainActor.run { trace("turn=\(turnID) first audio sent") }
                 }
             }
             try Task.checkCancellation()
-            try await socket.send(.string(#"{"type":"input_audio_buffer.commit"}"#))
+            if doubao {
+                try await socket.send(.data(DoubaoWire.frame(0x22, buffered)))
+            } else {
+                try await socket.send(.string(#"{"type":"input_audio_buffer.commit"}"#))
+            }
             await MainActor.run { trace("turn=\(turnID) commit sent") }
         } catch {
             socket.cancel(with: .goingAway, reason: nil)
@@ -378,7 +407,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         guard let turn = recording else { return }
         recording = nil
         capture.stop()
-        guard capturedBytes >= 4_800 else {
+        guard capturedBytes >= (turn.connection?.doubao == true ? 3200 : 4800) else {
             trace("capture shorter than 100ms")
             finish(turn)
             return
@@ -821,14 +850,27 @@ private final class PreparedConnection {
     let ready: Task<Void, Error>
     private let session: URLSession
 
-    init(key: String) {
-        var request = URLRequest(url: URL(string: "wss://api.openai.com/v1/realtime?intent=transcription")!, timeoutInterval: 15)
-        request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
+    let doubao: Bool
+    init(key: String, doubao: Bool = false) {
+        self.doubao = doubao
+        var request = URLRequest(url: URL(string: doubao ? "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async" : "wss://api.openai.com/v1/realtime?intent=transcription")!, timeoutInterval: 15)
+        if doubao {
+            request.setValue(key, forHTTPHeaderField: "X-Api-Key")
+            request.setValue("volc.seedasr.sauc.duration", forHTTPHeaderField: "X-Api-Resource-Id")
+            request.setValue(id, forHTTPHeaderField: "X-Api-Request-Id")
+        } else {
+            request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
+        }
         session = URLSession(configuration: .ephemeral, delegate: ConnectionObserver(id), delegateQueue: nil)
         socket = session.webSocketTask(with: request)
         socket.resume()
         ready = Task { [socket, id] in
             await MainActor.run { trace("connection=\(id) setup started") }
+            if doubao {
+                let config = #"{"user":{"uid":"calci"},"audio":{"format":"pcm","codec":"raw","rate":16000,"bits":16,"channel":1},"request":{"model_name":"bigmodel","result_type":"full","enable_nonstream":true,"enable_punc":true,"enable_itn":true}}"#
+                try await socket.send(.data(DoubaoWire.frame(0x10, Data(config.utf8))))
+                return
+            }
             let update = #"{"type":"session.update","session":{"type":"transcription","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":null,"transcription":{"model":"gpt-live-transcribe","delay":"minimal","languages":["zh-cn","en"],"prompt":"日常口述，主要使用中文，可能在同一句话中夹杂英文单词、短语或完整英文句子。"}}}}}"#
             try await socket.send(.string(update))
             await MainActor.run { trace("connection=\(id) configuration sent model=gpt-live-transcribe delay=minimal languages=zh-cn,en context=mixed-language-v1") }
@@ -855,4 +897,68 @@ private final class PreparedConnection {
     }
 
     deinit { close() }
+}
+
+private enum DoubaoWire {
+    static func frame(_ type: UInt8, _ payload: Data) -> Data {
+        var result = Data([0x11, type, type == 0x10 ? 0x10 : 0, 0])
+        var size = UInt32(payload.count).bigEndian
+        withUnsafeBytes(of: &size) { result.append(contentsOf: $0) }
+        result.append(payload)
+        return result
+    }
+
+    static func decode(_ frame: Data) throws -> TranscriptionEvent {
+        let bytes = Array(frame)
+        guard bytes.count >= 8, bytes[0] >> 4 == 1 else { throw URLError(.cannotParseResponse) }
+        let flags = bytes[1] & 15
+        let kind = bytes[1] >> 4
+        var offset = Int(bytes[0] & 15) * 4
+        func word() throws -> UInt32 {
+            guard offset >= 4, offset + 4 <= bytes.count else { throw URLError(.cannotParseResponse) }
+            defer { offset += 4 }
+            return bytes[offset..<offset+4].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        }
+        if kind == 15 { throw NSError(domain: "DoubaoASR", code: Int(try word())) }
+        guard kind == 9 else { throw URLError(.cannotParseResponse) }
+        if flags & 1 != 0 { _ = try word() }
+        if flags & 4 != 0 { _ = try word() }
+        let size = Int(try word())
+        guard size == bytes.count - offset else { throw URLError(.cannotParseResponse) }
+        var payload = Data(bytes[offset...])
+        switch bytes[2] & 15 {
+        case 0: break
+        case 1: payload = try gunzip(payload)
+        default: throw URLError(.cannotDecodeContentData)
+        }
+        struct Response: Decodable {
+            struct Result: Decodable { let text: String? }
+            let result: Result?
+        }
+        let text = try JSONDecoder().decode(Response.self, from: payload).result?.text
+        return TranscriptionEvent(type: flags & 2 != 0 ? "conversation.item.input_audio_transcription.completed" : "snapshot", delta: nil, transcript: text, error: nil)
+    }
+
+    private static func gunzip(_ input: Data) throws -> Data {
+        var stream = z_stream()
+        guard inflateInit2_(&stream, 31, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else { throw URLError(.cannotDecodeContentData) }
+        defer { inflateEnd(&stream) }
+        return try input.withUnsafeBytes { raw in
+            stream.next_in = UnsafeMutablePointer(mutating: raw.bindMemory(to: UInt8.self).baseAddress)
+            stream.avail_in = UInt32(raw.count)
+            var result = Data()
+            var buffer = [UInt8](repeating: 0, count: 16384)
+            while result.count < 4_194_304 {
+                let status = buffer.withUnsafeMutableBufferPointer { out in
+                    stream.next_out = out.baseAddress
+                    stream.avail_out = UInt32(out.count)
+                    return inflate(&stream, Z_NO_FLUSH)
+                }
+                result.append(contentsOf: buffer.prefix(buffer.count - Int(stream.avail_out)))
+                if status == Z_STREAM_END { return result }
+                guard status == Z_OK else { break }
+            }
+            throw URLError(.cannotDecodeContentData)
+        }
+    }
 }

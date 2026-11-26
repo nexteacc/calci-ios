@@ -43,13 +43,13 @@ final class WebAudioCapture: NSObject {
         webView.loadHTMLString(Self.page, baseURL: URL(string: "https://keyboard-dictation.invalid/"))
     }
 
-    func start() {
+    func start(rate: Int) {
         guard isReady, !isCapturing else { return }
         isCapturing = true
         heartbeat = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.webView.evaluateJavaScript("captureHeartbeat()") }
         }
-        webView.evaluateJavaScript("startCapture(); 0") { [weak self] _, error in
+        webView.evaluateJavaScript("startCapture(\(rate)); 0") { [weak self] _, error in
             if let error { Task { @MainActor in self?.finish(reason: "start failed: \(error.localizedDescription)") } }
         }
     }
@@ -95,7 +95,7 @@ final class WebAudioCapture: NSObject {
 
     private static let page = """
     <!doctype html><html><body><script>
-    const targetRate = \(Int(sampleRate));
+
     const post = message => window.webkit.messageHandlers.capture.postMessage(message);
     const encode = samples => {
       const bytes = new Uint8Array(samples.buffer, 0, samples.length * 2);
@@ -107,7 +107,7 @@ final class WebAudioCapture: NSObject {
     window.captureHeartbeat = () => { lastHeartbeat = performance.now(); };
     let stopCapture = () => {};
     window.stopCapture = () => stopCapture();
-    window.startCapture = async () => {
+    window.startCapture = async (targetRate) => {
       let stopping = false, stream, context, source, processor, sink, watchdog;
       const audioSession = navigator.audioSession;
       const previousType = audioSession?.type ?? 'auto';

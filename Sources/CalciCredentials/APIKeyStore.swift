@@ -2,11 +2,13 @@ import Foundation
 import Security
 
 public enum APIKeyStore {
-    private static let item = SharedKeychainItem(service: "Calci.OpenAI", account: "personal")
+    private static func item(_ service: String) -> SharedKeychainItem {
+        SharedKeychainItem(service: service, account: "personal")
+    }
 
-    public static func read() -> String? { item.read() }
-    public static func save(_ key: String) -> Bool { item.save(key) }
-    public static func remove() -> Bool { item.remove() }
+    public static func read(_ service: String = "Calci.OpenAI") -> String? { item(service).read() }
+    public static func save(_ key: String, _ service: String = "Calci.OpenAI") -> Bool { item(service).save(key) }
+    public static func remove(_ service: String = "Calci.OpenAI") -> Bool { item(service).remove() }
 }
 
 public enum KeyboardHand: String {
