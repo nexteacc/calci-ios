@@ -65,6 +65,8 @@ final class DemoKeyboardViewController: UIInputViewController {
     private let nextKeyboardButton = UIButton(type: .system)
     private let returnButton = UIButton(type: .system)
     private let deleteButton = UIButton(type: .system)
+    private var keyboardHand: KeyboardHand?
+    private var handConstraints: [NSLayoutConstraint] = []
     private var clearTextTask: Task<Void, Never>?
 
     private final class Turn {
@@ -120,6 +122,7 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        applyKeyboardHand()
         syncKeyboardAppearance()
         updateReturnButton()
     }
@@ -645,22 +648,43 @@ final class DemoKeyboardViewController: UIInputViewController {
             dictateButton.widthAnchor.constraint(equalToConstant: Panel.voiceDiameter),
             dictateButton.heightAnchor.constraint(equalTo: dictateButton.widthAnchor),
 
-            returnButton.trailingAnchor.constraint(equalTo: safeArea.trailingAnchor, constant: -Panel.sideInset),
             returnButton.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
             returnButton.widthAnchor.constraint(greaterThanOrEqualToConstant: Panel.actionWidth),
             returnButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
-            returnButton.leadingAnchor.constraint(greaterThanOrEqualTo: dictateButton.trailingAnchor, constant: 8),
 
             deleteButton.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
             deleteButton.leadingAnchor.constraint(equalTo: returnButton.leadingAnchor),
             deleteButton.trailingAnchor.constraint(equalTo: returnButton.trailingAnchor),
             deleteButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
 
-            nextKeyboardButton.leadingAnchor.constraint(equalTo: safeArea.leadingAnchor, constant: Panel.sideInset),
             nextKeyboardButton.centerYAnchor.constraint(equalTo: returnButton.centerYAnchor),
             nextKeyboardButton.widthAnchor.constraint(equalToConstant: 44),
             nextKeyboardButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
         ])
+        applyKeyboardHand()
+    }
+
+    private func applyKeyboardHand() {
+        let hand = KeyboardHand.read()
+        guard hand != keyboardHand else { return }
+        keyboardHand = hand
+        let safeArea = view.safeAreaLayoutGuide
+        NSLayoutConstraint.deactivate(handConstraints)
+        switch hand {
+        case .left:
+            handConstraints = [
+                returnButton.leftAnchor.constraint(equalTo: safeArea.leftAnchor, constant: Panel.sideInset),
+                returnButton.rightAnchor.constraint(lessThanOrEqualTo: dictateButton.leftAnchor, constant: -8),
+                nextKeyboardButton.rightAnchor.constraint(equalTo: safeArea.rightAnchor, constant: -Panel.sideInset),
+            ]
+        case .right:
+            handConstraints = [
+                returnButton.rightAnchor.constraint(equalTo: safeArea.rightAnchor, constant: -Panel.sideInset),
+                returnButton.leftAnchor.constraint(greaterThanOrEqualTo: dictateButton.rightAnchor, constant: 8),
+                nextKeyboardButton.leftAnchor.constraint(equalTo: safeArea.leftAnchor, constant: Panel.sideInset),
+            ]
+        }
+        NSLayoutConstraint.activate(handConstraints)
     }
 
     override func viewDidLayoutSubviews() {

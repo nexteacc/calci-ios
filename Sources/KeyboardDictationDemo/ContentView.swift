@@ -11,6 +11,8 @@ struct ContentView: View {
     @State private var key = ""
     @State private var saved = APIKeyStore.read() != nil
     @State private var keyError = false
+    @State private var keyboardHand = KeyboardHand.read()
+    @State private var layoutError = false
 
     var body: some View {
         Form {
@@ -29,6 +31,20 @@ struct ContentView: View {
                 Button("打开设置", action: openSettings)
             } header: {
                 stepTitle("2. 添加键盘")
+            }
+
+            Section {
+                Picker("操作手", selection: Binding(get: { keyboardHand }, set: { hand in
+                    layoutError = !hand.save()
+                    if !layoutError { keyboardHand = hand }
+                })) {
+                    Text("左手").tag(KeyboardHand.left)
+                    Text("右手").tag(KeyboardHand.right)
+                }
+                .pickerStyle(.segmented)
+                if layoutError { Text("布局未保存，请重试。") }
+            } header: {
+                stepTitle("键盘布局")
             }
 
             Section {
