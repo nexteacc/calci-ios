@@ -38,6 +38,7 @@ struct ContentView: View {
             Section {
                 Toggle("左手", isOn: layoutSelection(.left)).toggleStyle(.switch).tint(.green)
                 Toggle("右手", isOn: layoutSelection(.right)).toggleStyle(.switch).tint(.green)
+                Toggle("底部布局", isOn: layoutSelection(.bottom)).toggleStyle(.switch).tint(.green)
                 if layoutError { Text("布局未保存，请重试。") }
             } header: {
                 stepTitle("键盘布局")
@@ -92,10 +93,9 @@ struct ContentView: View {
         Binding(
             get: { keyboardHand == hand },
             set: { enabled in
-                let selected: KeyboardHand = enabled ? hand : (hand == .left ? .right : .left)
-                guard selected != keyboardHand else { return }
-                layoutError = !selected.save()
-                if !layoutError { keyboardHand = selected }
+                guard enabled, hand != keyboardHand else { return }
+                layoutError = !hand.save()
+                if !layoutError { keyboardHand = hand }
             }
         )
     }

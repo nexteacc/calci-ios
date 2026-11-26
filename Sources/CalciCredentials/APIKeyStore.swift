@@ -14,6 +14,7 @@ public enum APIKeyStore {
 public enum KeyboardHand: String {
     case left
     case right
+    case bottom
 
     private static let item = SharedKeychainItem(service: "Calci.KeyboardLayout", account: "hand")
 

@@ -11,7 +11,7 @@ final class WebAudioCapture: NSObject {
     static let sampleRate: Double = 24_000
 
     var onReady: (() -> Void)?
-    var onStarted: (() -> Void)?
+    var onStage: ((String, Int) -> Void)?
     var onAudio: ((Data, [UInt8]) -> Void)?
     var onEnded: ((String) -> Void)?
 
@@ -91,8 +91,10 @@ final class WebAudioCapture: NSObject {
         case "ready":
             isReady = true
             onReady?()
-        case "started":
-            onStarted?()
+        case "stage":
+            guard let stage = message["stage"] as? String,
+                  let elapsed = message["elapsedMs"] as? Int else { return }
+            onStage?(stage, elapsed)
         case "audio":
             guard isCapturing, let base64 = message["data"] as? String, let data = Data(base64Encoded: base64) else { return }
             onAudio?(data, message["bands"] as? [UInt8] ?? [])
@@ -119,6 +121,8 @@ final class WebAudioCapture: NSObject {
     window.stopCapture = () => stopCapture();
     window.startCapture = async (targetRate, id) => {
       const emit = message => post({ ...message, id });
+      const startedAt = performance.now();
+      const stage = name => emit({ type: 'stage', stage: name, elapsedMs: Math.round(performance.now() - startedAt) });
       let stopping = false, stream, context, source, processor, sink, watchdog;
       const audioSession = navigator.audioSession;
       const previousType = audioSession?.type ?? 'auto';
@@ -138,16 +142,19 @@ final class WebAudioCapture: NSObject {
       stopCapture = cleanup;
       try {
         try { if (audioSession) audioSession.type = 'play-and-record'; } catch (_) {}
+        stage('mic-request');
         stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
         if (stopping) { stream.getTracks().forEach(track => track.stop()); return; }
+        stage('mic-stream-ready');
         const track = stream.getAudioTracks()[0];
         track.onended = () => interrupted('track-ended');
         // Defer the AudioContext until capture: creating one can take audio focus.
         context = new AudioContext({ latencyHint: 'interactive' });
         await context.resume();
         if (stopping) return;
+        stage('audio-context-running');
         processor = context.createScriptProcessor(1024, 1, 1);
         sink = context.createGain();
         sink.gain.value = 0;
@@ -165,7 +172,7 @@ final class WebAudioCapture: NSObject {
         lastHeartbeat = performance.now();
         watchdog = setInterval(() => { if (performance.now() - lastHeartbeat > 3000) interrupted('native-heartbeat-expired'); }, 500);
         const step = context.sampleRate / targetRate;
-        let position = 0, sum = 0, count = 0;
+        let position = 0, sum = 0, count = 0, signalLogged = false;
         processor.onaudioprocess = event => {
           if (stopping) return;
           const input = event.inputBuffer.getChannelData(0);
@@ -179,10 +186,15 @@ final class WebAudioCapture: NSObject {
               sum = 0; count = 0;
             }
           }
+          // A level marker for diagnostics, independent of speech recognition.
+          if (!signalLogged && Math.sqrt(energy / input.length) >= 0.01) {
+            signalLogged = true;
+            stage('signal-above-minus-40-dBFS');
+          }
           analyser.getByteFrequencyData(bins);
           if (written > 0) emit({ type: 'audio', data: encode(output.subarray(0, written)), bands: Array.from({length: 12}, (_, i) => bins[6 + Math.floor(i * 45 / 12)]) });
         };
-        emit({ type: 'started', sampleRate: context.sampleRate });
+        stage('audio-pipeline-ready');
       } catch (error) {
         if (stopping) return;
         cleanup();

@@ -1,6 +1,7 @@
 import zlib
 import AVFoundation
 import OSLog
+import Network
 #if SWIFT_PACKAGE
 import CalciCredentials
 #endif
@@ -8,15 +9,57 @@ import UIKit
 
 private let log = Logger(subsystem: "net.stupidtech.keyboard-dictation-demo.keyboard", category: "dictation")
 
+private final class DiagnosticLog: @unchecked Sendable {
+    static let shared = DiagnosticLog()
+    private let queue = DispatchQueue(label: "calci.diagnostics", qos: .utility)
+    private let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("calci-diagnostics", isDirectory: true)
+    private var day: String?
+    private var file: FileHandle?
+
+    func append(_ message: String) {
+        let timestamp = Date().formatted(.iso8601.time(includingFractionalSeconds: true))
+        let uptimeMs = Int(ProcessInfo.processInfo.systemUptime * 1000)
+        let line = Data("\(timestamp) uptimeMs=\(uptimeMs) \(message)\n".utf8)
+        let now = Date()
+        queue.async {
+            do {
+                let date = now.formatted(.iso8601.year().month().day().dateSeparator(.dash))
+                if self.day != date || self.file == nil {
+                    try self.file?.close()
+                    self.file = nil
+                    try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
+                    let url = self.directory.appendingPathComponent(date + ".log")
+                    if !FileManager.default.fileExists(atPath: url.path) {
+                        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                            throw CocoaError(.fileWriteUnknown)
+                        }
+                    }
+                    let file = try FileHandle(forWritingTo: url)
+                    try file.seekToEnd()
+                    self.file = file
+                    self.day = date
+                    let expires = now.addingTimeInterval(-7 * 86_400)
+                        .formatted(.iso8601.year().month().day().dateSeparator(.dash))
+                    if let files = try? FileManager.default.contentsOfDirectory(at: self.directory, includingPropertiesForKeys: nil) {
+                        for old in files where old.pathExtension == "log" && old.deletingPathExtension().lastPathComponent < expires {
+                            try? FileManager.default.removeItem(at: old)
+                        }
+                    }
+                }
+                try self.file?.write(contentsOf: line)
+            } catch {
+                try? self.file?.close()
+                self.file = nil
+                log.error("Diagnostic log write failed")
+            }
+        }
+    }
+}
+
 @MainActor
 private func trace(_ message: String) {
-    let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("calci-diagnostics.log")
-    let line = "\(Date().formatted(.iso8601.time(includingFractionalSeconds: true))) \(message)\n"
-    var data = (try? Data(contentsOf: url)) ?? Data()
-    if data.count > 65_536 { data = Data(data.suffix(32_768)) }
-    data.append(contentsOf: line.utf8)
-    try? data.write(to: url, options: .atomic)
+    DiagnosticLog.shared.append(message)
     log.info("\(message, privacy: .public)")
 }
 
@@ -63,8 +106,17 @@ final class DemoKeyboardViewController: UIInputViewController {
     private var handConstraints: [NSLayoutConstraint] = []
     private var clearTextTask: Task<Void, Never>?
 
+    private enum EndReason: String {
+        case finalized, releasedTooShort, swipeCancelled, gestureCancelled
+        case keyboardDisappeared, documentChanged, inputChanged
+        case microphoneInterrupted, serviceError, connectionError, timedOut, receiveEnded
+    }
+
     private final class Turn {
         let id = UUID().uuidString.prefix(8)
+        var capturedBytes = 0
+        var released = false
+        var firstTextLogged = false
         let audio: AsyncStream<Data>.Continuation
         var task: Task<Void, Never>?
         var timeout: Task<Void, Never>?
@@ -96,25 +148,44 @@ final class DemoKeyboardViewController: UIInputViewController {
     private var expectedContext: InputContext?
     private var capturedBytes = 0
 
+    private let networkMonitor = NWPathMonitor()
+    private var networkType = "unknown"
+    private var touchStartedAt: TimeInterval?
+
     override func viewDidLoad() {
         super.viewDidLoad()
         hasDictationKey = true
-        trace("keyboard loaded")
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        trace("keyboard loaded build=\(version) diagnosticsSchema=3")
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            let type: String
+            if path.status != .satisfied { type = "unavailable" }
+            else if path.usesInterfaceType(.wifi) { type = "wifi" }
+            else if path.usesInterfaceType(.cellular) { type = "cellular" }
+            else if path.usesInterfaceType(.wiredEthernet) { type = "wired" }
+            else { type = "other" }
+            Task { @MainActor [weak self] in self?.networkType = type }
+        }
+        networkMonitor.start(queue: DispatchQueue(label: "calci.network-path"))
         configureView()
         capture.onReady = { [weak self] in trace("web capture ready"); self?.render() }
-        capture.onStarted = { trace("microphone started") }
+        capture.onStage = { [weak self] stage, elapsed in
+            guard let turn = self?.recording else { return }
+            trace("turn=\(turn.id) capture stage=\(stage) webElapsedMs=\(elapsed)")
+        }
         capture.onAudio = { [weak self] data, bands in
-            guard let self else { return }
-            if self.capturedBytes == 0 { trace("first captured frame bytes=\(data.count)") }
+            guard let self, let turn = self.recording else { return }
+            if self.capturedBytes == 0 { trace("turn=\(turn.id) first captured frame bytes=\(data.count)") }
+            turn.capturedBytes += data.count
             self.capturedBytes += data.count
-            self.recording?.audio.yield(data)
+            turn.audio.yield(data)
             self.updateMeter(bands)
         }
         capture.onEnded = { [weak self] reason in
             trace("capture ended: \(reason)")
             guard reason != "stopped" else { return }
             log.error("Microphone capture interrupted")
-            if let self, let turn = self.recording { self.showFailure("麦克风中断"); self.finish(turn) }
+            if let self, let turn = self.recording { self.showFailure("麦克风中断"); self.finish(turn, reason: .microphoneInterrupted) }
         }
         capture.attach(to: view)
         render()
@@ -126,7 +197,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         stopRepeatingDelete()
         discardStandby()
         standbyState = "keyboard-hidden"
-        finishRecognition()
+        finishRecognition(reason: .keyboardDisappeared)
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -158,6 +229,7 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     @objc private func beginDictationTouch() {
         guard recording == nil, !isDictationTouchDown else { return }
+        touchStartedAt = ProcessInfo.processInfo.systemUptime
         isDictationTouchDown = true
         // A small pulse acknowledges the touch before any audio is captured.
         drawMeter([4, 8, 20, 39, 56, 46, 28, 18, 10, 6, 4, 2])
@@ -195,7 +267,7 @@ final class DemoKeyboardViewController: UIInputViewController {
             // Sideways movement and small shifts are normal while holding.
             let distance = holdOrigin.y - gesture.location(in: view).y
             if distance >= 64 {
-                cancelDictation()
+                cancelDictation(reason: .swipeCancelled)
                 releaseFeedback.impactOccurred()
             }
         case .ended:
@@ -205,13 +277,13 @@ final class DemoKeyboardViewController: UIInputViewController {
             pressFeedback.prepare()
         case .cancelled, .failed:
             endDictationTouch()
-            cancelDictation()
+            cancelDictation(reason: .gestureCancelled)
         default:
             break
         }
     }
 
-    private func cancelDictation() {
+    private func cancelDictation(reason: EndReason) {
         guard let turn = recording else { return }
         pendingSendDocument = nil
         // Only the first turn can have inserted a partial result. Never delete
@@ -219,13 +291,13 @@ final class DemoKeyboardViewController: UIInputViewController {
         if turns.first === turn {
             guard recordingDocument == textDocumentProxy.documentIdentifier,
                   currentContext == expectedContext else {
-                finishRecognition()
+                finishRecognition(reason: currentContext.document == expectedContext?.document ? .inputChanged : .documentChanged)
                 return
             }
             replacePartial(with: "")
         }
         turn.text = ""
-        finish(turn)
+        finish(turn, reason: reason)
         prepareStandby()
         UIAccessibility.post(notification: .announcement, argument: "已取消")
     }
@@ -295,7 +367,9 @@ final class DemoKeyboardViewController: UIInputViewController {
         let turn = Turn(continuation)
         if turns.isEmpty { expectedContext = currentContext }
         turn.connection = connection
-        trace("turn=\(turn.id) connection=\(connection.id) hold accepted provider=\(provider) standby=\(preflight) msSinceStandbyStart=\(age)")
+        let touchLeadMs = touchStartedAt.map { Int((ProcessInfo.processInfo.systemUptime - $0) * 1000) }
+        touchStartedAt = nil
+        trace("turn=\(turn.id) connection=\(connection.id) hold accepted provider=\(provider) standby=\(preflight) msSinceStandbyStart=\(age) touchLeadMs=\(touchLeadMs.map(String.init) ?? "na") network=\(networkType)")
         recordingDocument = textDocumentProxy.documentIdentifier
         recording = turn
         updateFeedback()
@@ -304,6 +378,7 @@ final class DemoKeyboardViewController: UIInputViewController {
         turn.task = Task { [weak self] in
             defer { connection.close() }
             await withTaskCancellationHandler {
+                var outcome: EndReason = .receiveEnded
                 var sender: Task<Void, Error>?
                 defer { sender?.cancel() }
                 do {
@@ -336,10 +411,10 @@ final class DemoKeyboardViewController: UIInputViewController {
                             event = try JSONDecoder().decode(TranscriptionEvent.self, from: Data(payload.utf8))
                         }
                         guard let self, !Task.isCancelled, !turn.done else { break }
-                        guard self.textDocumentProxy.documentIdentifier == document else { self.finishRecognition(); break }
+                        guard self.textDocumentProxy.documentIdentifier == document else { self.finishRecognition(reason: .documentChanged); break }
                         guard self.currentContext == self.expectedContext else {
                             trace("input position changed")
-                            self.finishRecognition()
+                            self.finishRecognition(reason: .inputChanged)
                             break
                         }
                         switch event.type {
@@ -352,29 +427,33 @@ final class DemoKeyboardViewController: UIInputViewController {
                         case "conversation.item.input_audio_transcription.delta":
                             if let delta = event.delta { if turn.text.isEmpty { trace("turn=\(turn.id) first delta") }; turn.text += delta; self.flushTurns() }
                         case "conversation.item.input_audio_transcription.completed":
+                            outcome = .finalized
                             trace("turn=\(turn.id) final received")
                             if let final = event.transcript { turn.text = final; self.flushTurns() }
                         case "error", "conversation.item.input_audio_transcription.failed":
                             self.showFailure("转写失败")
-                            trace("OpenAI error " + (event.error?.code ?? "unknown"))
+                            outcome = .serviceError
+                            trace("turn=\(turn.id) service error provider=\(provider) code=\(event.error?.code ?? "unknown")")
                         default: continue
                         }
                         if ["conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.failed", "error"].contains(event.type) { break }
                     }
                 } catch {
                     if !Task.isCancelled {
-                        self?.showFailure("连接失败")
                         let failure = error as NSError
+                        outcome = failure.domain == "DoubaoASR" ? .serviceError : .connectionError
+                        self?.showFailure(outcome == .serviceError ? "转写失败" : "连接失败")
                         trace("turn=\(turn.id) connection error domain=\(failure.domain) code=\(failure.code) description=\(failure.localizedDescription)")
                     }
                 }
                 turn.connection?.close()
-                if !Task.isCancelled { self?.finish(turn) }
+                if !Task.isCancelled { self?.finish(turn, reason: outcome) }
                 sender?.cancel()
             } onCancel: {
                 connection.close()
             }
         }
+        trace("turn=\(turn.id) capture requested sampleRate=\(doubao ? 16000 : 24000)")
         capture.start(rate: doubao ? 16000 : 24000)
     }
 
@@ -384,22 +463,29 @@ final class DemoKeyboardViewController: UIInputViewController {
             var buffered = Data()
             for await frame in frames {
                 try Task.checkCancellation()
+                let payloadBytes: Int
                 if doubao {
                     buffered.append(frame)
                     guard buffered.count >= 6400 else { continue }
+                    payloadBytes = buffered.count
                     try await socket.send(.data(DoubaoWire.frame(0x20, buffered)))
                     buffered.removeAll(keepingCapacity: true)
                 } else {
+                    payloadBytes = frame.count
                     try await socket.send(.string(#"{"type":"input_audio_buffer.append","audio":""# + frame.base64EncodedString() + #""}"#))
                 }
                 if !sentFirst {
                     sentFirst = true
-                    await MainActor.run { trace("turn=\(turnID) first audio sent") }
+                    await MainActor.run { trace("turn=\(turnID) first audio sent payloadBytes=\(payloadBytes)") }
                 }
             }
             try Task.checkCancellation()
             if doubao {
                 try await socket.send(.data(DoubaoWire.frame(0x22, buffered)))
+                if !sentFirst, !buffered.isEmpty {
+                    let size = buffered.count
+                    await MainActor.run { trace("turn=\(turnID) first audio sent payloadBytes=\(size) finalPacket=true") }
+                }
             } else {
                 try await socket.send(.string(#"{"type":"input_audio_buffer.commit"}"#))
             }
@@ -411,13 +497,14 @@ final class DemoKeyboardViewController: UIInputViewController {
     }
 
     private func stopDictation() {
-        trace("hold released capturedBytes=\(capturedBytes)")
         guard let turn = recording else { return }
+        turn.released = true
+        trace("turn=\(turn.id) hold released capturedBytes=\(capturedBytes)")
         recording = nil
         capture.stop()
         guard capturedBytes >= (turn.connection?.doubao == true ? 3200 : 4800) else {
             trace("capture shorter than 100ms")
-            finish(turn)
+            finish(turn, reason: .releasedTooShort)
             return
         }
         turn.audio.finish()
@@ -427,24 +514,35 @@ final class DemoKeyboardViewController: UIInputViewController {
             try? await Task.sleep(for: .seconds(20))
             guard !Task.isCancelled else { return }
             self?.showFailure("转写超时")
-            self?.finish(turn)
+            self?.finish(turn, reason: .timedOut)
         }
     }
 
-    private func replacePartial(with text: String) {
+    private func replacePartial(with text: String, for turn: Turn? = nil) {
         guard text != insertedPartial else { return }
         // Only rewrite the suffix that changed to minimise flicker in the host field.
         let common = zip(insertedPartial, text).prefix { $0 == $1 }.count
         for _ in 0..<(insertedPartial.count - common) { textDocumentProxy.deleteBackward() }
         let suffix = String(text.dropFirst(common))
-        if !suffix.isEmpty { textDocumentProxy.insertText(suffix) }
-        trace("inserted transcript characters=\(text.count)")
+        if !suffix.isEmpty {
+            textDocumentProxy.insertText(suffix)
+            if let turn, !turn.firstTextLogged {
+                turn.firstTextLogged = true
+                trace("turn=\(turn.id) first text inserted")
+            }
+        }
         expectedContext = currentContext
         insertedPartial = text
     }
 
-    private func finish(_ turn: Turn) {
+    private func logEnd(_ turn: Turn, reason: EndReason) {
+        let provider = turn.connection?.doubao == true ? "Doubao" : "OpenAI"
+        trace("turn=\(turn.id) ended reason=\(reason.rawValue) provider=\(provider) network=\(networkType) released=\(turn.released) capturedBytes=\(turn.capturedBytes)")
+    }
+
+    private func finish(_ turn: Turn, reason: EndReason) {
         guard !turn.done else { return }
+        logEnd(turn, reason: reason)
         turn.done = true
         turn.connection?.close()
         turn.connection = nil
@@ -471,21 +569,22 @@ final class DemoKeyboardViewController: UIInputViewController {
 
     private func flushTurns() {
         guard currentContext == expectedContext else {
-            finishRecognition()
+            finishRecognition(reason: currentContext.document == expectedContext?.document ? .inputChanged : .documentChanged)
             return
         }
         while let first = turns.first {
-            replacePartial(with: first.text)
+            replacePartial(with: first.text, for: first)
             guard first.done else { return }
             turns.removeFirst()
             insertedPartial = ""
         }
     }
 
-    private func finishRecognition() {
+    private func finishRecognition(reason: EndReason) {
         pendingSendDocument = nil
         recording = nil
         for turn in turns {
+            if !turn.done { logEnd(turn, reason: reason) }
             turn.done = true
             turn.connection?.close()
             turn.task?.cancel()
@@ -528,7 +627,7 @@ final class DemoKeyboardViewController: UIInputViewController {
                           self.textDocumentProxy.documentIdentifier == document,
                           !self.capture.isCapturing, self.turns.isEmpty else { return }
                     let proxy = self.textDocumentProxy
-                    if !clearing && ProcessInfo.processInfo.systemUptime - started >= 1.0 {
+                    if !clearing && ProcessInfo.processInfo.systemUptime - started >= 0.8 {
                         clearing = true
                         self.gestureHint.text = "正在清空"
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -692,11 +791,8 @@ final class DemoKeyboardViewController: UIInputViewController {
             returnButton.widthAnchor.constraint(greaterThanOrEqualToConstant: Panel.actionWidth),
             returnButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
 
-            deleteButton.topAnchor.constraint(equalTo: meter.topAnchor),
-            deleteButton.widthAnchor.constraint(equalToConstant: Panel.deleteWidth),
             deleteButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
 
-            nextKeyboardButton.centerYAnchor.constraint(equalTo: returnButton.centerYAnchor),
             nextKeyboardButton.widthAnchor.constraint(equalToConstant: 44),
             nextKeyboardButton.heightAnchor.constraint(equalToConstant: Panel.actionHeight),
         ])
@@ -712,6 +808,9 @@ final class DemoKeyboardViewController: UIInputViewController {
         switch hand {
         case .left:
             handConstraints = [
+                deleteButton.widthAnchor.constraint(equalToConstant: Panel.deleteWidth),
+                deleteButton.topAnchor.constraint(equalTo: meter.topAnchor),
+                nextKeyboardButton.centerYAnchor.constraint(equalTo: returnButton.centerYAnchor),
                 deleteButton.leftAnchor.constraint(equalTo: returnButton.leftAnchor),
                 returnButton.leftAnchor.constraint(equalTo: safeArea.leftAnchor, constant: Panel.sideInset),
                 returnButton.rightAnchor.constraint(lessThanOrEqualTo: dictateButton.leftAnchor, constant: -8),
@@ -719,10 +818,23 @@ final class DemoKeyboardViewController: UIInputViewController {
             ]
         case .right:
             handConstraints = [
+                deleteButton.widthAnchor.constraint(equalToConstant: Panel.deleteWidth),
+                deleteButton.topAnchor.constraint(equalTo: meter.topAnchor),
+                nextKeyboardButton.centerYAnchor.constraint(equalTo: returnButton.centerYAnchor),
                 deleteButton.rightAnchor.constraint(equalTo: returnButton.rightAnchor),
                 returnButton.rightAnchor.constraint(equalTo: safeArea.rightAnchor, constant: -Panel.sideInset),
                 returnButton.leftAnchor.constraint(greaterThanOrEqualTo: dictateButton.rightAnchor, constant: 8),
                 nextKeyboardButton.leftAnchor.constraint(equalTo: safeArea.leftAnchor, constant: Panel.sideInset),
+            ]
+        case .bottom:
+            handConstraints = [
+                deleteButton.widthAnchor.constraint(equalTo: returnButton.widthAnchor, multiplier: 0.618),
+                deleteButton.leftAnchor.constraint(equalTo: safeArea.leftAnchor, constant: Panel.sideInset),
+                deleteButton.centerYAnchor.constraint(equalTo: returnButton.centerYAnchor),
+                returnButton.rightAnchor.constraint(equalTo: safeArea.rightAnchor, constant: -Panel.sideInset),
+                returnButton.leftAnchor.constraint(greaterThanOrEqualTo: dictateButton.rightAnchor, constant: 8),
+                nextKeyboardButton.leftAnchor.constraint(equalTo: safeArea.leftAnchor, constant: Panel.sideInset),
+                nextKeyboardButton.topAnchor.constraint(equalTo: meter.topAnchor),
             ]
         }
         NSLayoutConstraint.activate(handConstraints)
